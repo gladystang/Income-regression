@@ -1,0 +1,726 @@
+###########################################
+# Loading the packages
+library(randomForest)
+library(caret)
+library(glmnet)
+library(xgboost)
+library(ggplot2)
+library(gridExtra)
+library(sm)
+library(Hmisc)
+###########################################
+# Data Loading and data understanding
+train = read.csv(file.choose(),header=T,sep=",")
+# delete the first column or train$X <- NULL
+train <- subset(train, select=FicoScore:Var_747)
+
+#keep the raw data
+raw_data <- train
+
+###########################################
+names(train)
+summary(train)
+dim(train)
+str(train)
+######################################################################################
+#since var_688 to var_702 are factor variables, then count the NA seperaterly
+#Add an additional attribute called na_count to indicate the count of NA in each row
+NA_Count <-  rowSums(is.na(train[,1:689]))+rowSums(train[,690:704]=='')+rowSums(is.na(train[,705:749]))
+train$na_count <- NA_Count
+#Plot the NA counts by Income
+plot(train$Income, train$na_count,main="Scatterplot of NA Counts by Income", 
+     xlab="Income", ylab="NA Counts ", pch=1)
+#From the plot above, we can see there is an outlier, remove it
+sub_data <- subset(train, Income < 930093000, select=FicoScore:na_count)
+#replot the data without the outlier
+plot(sub_data$Income, sub_data$na_count, main="Scatterplot of NA Counts by Income", 
+     xlab="Income", ylab="NA Counts ", pch=1)
+
+#add an attribute called incomelevel to sub_data to check the NA distribution for 
+#different income levels
+sub_data$incomelevel <- ifelse(sub_data$Income < 50000, "<50K", ">50K")
+
+boxplot (na_count ~ incomelevel, data = sub_data, 
+         main = "NA Counts distribution for different income levels",
+         xlab = "Income Levels", ylab = "NA Counts", col = "salmon")
+
+Col_na_count <- c(colSums(is.na(train[,1:689])),colSums(train[,690:704]==''),colSums(is.na(train[,705:749])))
+table(Col_na_count)
+
+hist(sub_data$na_count)
+sm.density(sub_data$na_count,xlab="NA Counts in Each Row")
+hist(sub_data$Income)
+hist(Col_na_count,breaks = 700,xlab="NA Counts in Each Column", col = "lightblue",main = "The Histogram of the NA Count")
+sm.density(Col_na_count,xlab="NA Counts in Each Column")
+
+#check the relation between The Number of Trades and Income
+qplot(Var_001,Income,data=sub_data,xlab="The Number of Trades",ylab="Income")
+qplot(Var_001,Income,data=sub_data,color=incomelevel, xlab="The Number of Trades",ylab="Income")
+
+#check the relation between FicoScore and Income
+qplot(FicoScore,Income,data=sub_data,xlab="FicoScore",ylab="Income")
+qplot(FicoScore,Income,data=sub_data,color=incomelevel, xlab="FicoScore",ylab="Income")
+
+#check the relation between Total monthly obligation for all accounts and Income
+qplot(Var_233,Income,data=sub_data,xlab="Total monthly obligation for all accounts",ylab="Income")
+qplot(Var_233,Income,data=sub_data,color=incomelevel, xlab="Total monthly obligation for all accounts",ylab="Income")
+
+
+#check the relation between Total open to buy of closed trades and Income
+qplot(Var_230,Income,data=sub_data,xlab="Total open to buy of closed trades",ylab="Income")
+qplot(Var_230,Income,data=sub_data,color=incomelevel, xlab="Total open to buy of closed trades",ylab="Income")
+
+######################################################################################
+# to check the missing data in each row and column
+sort(sub_data$na_count)
+
+sort(Col_na_count)
+##### Removing features with missing rate greater than 0.5 or missing value greater than 140000 (275593*0.5)
+cat("\n## Removing the features with missing rate greater than 0.5.\n")
+sum(Col_na_count > 140000)
+N <- sum(Col_na_count < 140000)
+
+toKeep <- names((sort(Col_na_count)))[1:N]
+
+features.1<-names(train)%in%toKeep
+
+dat_removeCol <-train[,features.1]
+
+#train <- train[, toKeep]
+##### Removing rows with missing value greater than 747,that is there is only Income column
+#summary(sub_data$na_count)
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#92.0   243.0   281.0   337.6   340.0   748.0
+
+dat_removeCol$na_count <- NA_Count
+
+dat_removeColRow <- dat_removeCol[dat_removeCol$na_count<747,]
+
+#write the data set to csv file after removing: 
+#features with missing rate greater than 0.5 or missing value greater than 140000
+#rows with missing value greater than 747(only income no features)
+
+write.csv(dat_removeColRow,"E:/payoff/dat_removeColRow.csv" )
+
+#calculate the Pearson correlation between Income and the features
+
+features <-names(dat_removeColRow)%in%c("Var_688","Var_689","Var_690","Var_691","Var_692","Var_693","Var_694","Var_695","Var_696","Var_697","Var_698","Var_699","Var_700","Var_701","Var_702")
+corr_data <-dat_removeColRow[,!(features)]
+corr_value <- c()
+for(i in 2:ncol(corr_data)){
+  corr_value <- c(corr_value, cor(corr_data[,1],corr_data[,i],use="complete.obs"))
+}
+
+corr_value_wname <- corr_value
+names(corr_value_wname) <- names( corr_data[,2:428] )
+
+sort(abs(corr_value))
+
+##### Removing constant features, there is no constant features in the cols
+cat("\n # Removing the constants features.\n")
+for (f in names(corr_data)) {
+  if (length(unique(corr_data[[f]])) == 1) {
+    cat(f, "is constant in train.subset, We delete it.\n")
+    corr_data[[f]] <- NULL
+  }
+}
+
+##### Removing identical features
+cat("\n # Removing the identical features.\n") 
+features_pair <- combn(names(corr_data), 2, simplify = F)
+toRemove <- c()
+for(pair in features_pair) {
+  f1 <- pair[1]
+  f2 <- pair[2]
+  
+  if (!(f1 %in% toRemove) & !(f2 %in% toRemove)) {
+    if (all(corr_data[[f1]] == corr_data[[f2]],na.rm = TRUE)) {
+      cat(f1, "and", f2, "are equals.\n")
+      toRemove <- c(toRemove, f2)
+    }
+  }
+}
+
+
+
+# Var_376 and Var_607 are equals.
+# Var_359 and Var_366 are equals.
+# toRemove
+# [1] "Var_607" "Var_366"
+
+
+feature.names <- setdiff(names(corr_data), toRemove)
+
+# data set after removeing rows and columns, and identical features
+corr_data.1 <- corr_data[, feature.names]
+###################################################################
+#calculate the Pearson correlation between the features
+###################################################################
+# pairs of columns
+features.2 <-names(corr_data.1)%in%c("Var_688","Var_689","Var_690","Var_691","Var_692","Var_693","Var_694","Var_695","Var_696","Var_697","Var_698","Var_699","Var_700","Var_701","Var_702")
+
+corX <- corr_data.1[,!(features.2)][,-2]
+##################################################################
+
+feature.pairs <- combn(x = names(corX), m = 2, simplify = F) #T gives matrix, F gives list
+correlated.pairs <- matrix(nrow = 2) #create an empty matrix
+for(pair in feature.pairs) {
+  f1 <- pair[1]
+  f2 <- pair[2]
+  if(!is.na(cor(corX[[f1]] , corX[[f2]], use= "complete.obs"))&abs(cor(corX[[f1]] , corX[[f2]], use= "complete.obs")) > 0.8 )
+  {
+    cat(f1, "and", f2, "are highly correlated \n")
+    correlated.pairs <- cbind(correlated.pairs, c(f1,f2))
+  }
+}
+##########testing errors##################
+# i <- 6
+#   for(j in (i+1):length(corX)){
+#     
+#     a<-cor(corX[,i], corX[,j], use= "complete.obs")
+#     if(!is.na(a) & a > 0.8)
+#     {
+#       cat(names(corX)[i],"and",names(corX)[j], "are highly correlated \n")
+#       correlated.pairs <- cbind(correlated.pairs, c(names(corX)[i],names(corX)[j]))
+#     }
+#     
+# }
+###########################################
+
+###########################################
+#removing highly correlated pairs
+###########################################
+# remove higly correlated variables
+cor_v<-abs(cor(corX,use= "complete.obs"))
+diag(cor_v)<-0
+cor_v[upper.tri(cor_v)] <- 0
+cor_f <- data.frame(which(!is.na(cor_v) & cor_v > 0.8, arr.ind = T))
+new_data <- corX[,-c(unique(cor_f$row))]
+
+write.csv(new_data,"E:/payoff/datawithouthighcor.csv" )
+
+
+###############################################################
+#data preparation
+
+# Data preparation
+# In this work, we analyse the use of the k-nearest neighbour as an imputation method for #missing data.
+# The main benefits for kNN:
+# k-nearest neighbour can predict both discrete attributes (the most frequent value
+# among the k nearest neighbours) and continuous attributes (the mean among the k
+# nearest neighbours);
+#  
+#  
+# prepare the data
+# 
+# library(VIM)
+# train.csv <- kNN(new_data,k=2)
+#  
+# 
+# write.csv(train.csv,"E:/payoff/trainimpute.csv" )
+# 
+# train.csv = read.csv(file.choose(),header=T,sep=",")
+# 
+# summary(train.csv)
+################################################################
+datawithouthighcor = read.csv(file.choose(),header=T,sep=",")
+
+data_whc <- new_data
+data_whc$Income <- corr_data.1$Income
+names(data_whc)
+summary(data_whc)
+dim(data_whc)
+str(data_whc)
+
+################################################################
+
+#calculate the Pearson correlation between Income and the rest features, then impute the data
+
+corr_data.1 <-data_whc
+corr_value.1 <- c()
+for(i in 1:(ncol(corr_data.1)-1)){
+  corr_value.1 <- c(corr_value.1, cor(corr_data.1$Income,corr_data.1[,i],use="complete.obs"))
+}
+
+#####impute the data with the first and third quantile
+for(i in 1:length(corr_data.1)){
+  
+  if (corr_value.1[i] > 0 & (sum(is.na(corr_data.1[,i]))!=0))
+  {
+    #impute with  the first quantile
+    corr_data.1[,i][is.na(corr_data.1[,i])] = quantile(corr_data.1[,i], .25, na.rm=TRUE)
+  }
+  else if (corr_value.1[i] < 0 & (sum(is.na(corr_data.1[,i]))!=0))
+  {
+    #impute with  the third quantile
+    corr_data.1[,i][is.na(corr_data.1[,i])] = quantile(corr_data.1[,i], .75, na.rm=TRUE)
+  }
+  
+}
+
+write.csv(corr_data.1,"E:/payoff/imputedata.csv" )
+corr_data.1 <- read.csv(file.choose(),header = T, sep = ',')
+head(corr_data.1)
+
+#==============================================================================
+#
+# Exploratory Modeling
+#
+#==============================================================================
+
+
+# library(randomForest)
+# 
+# # Train a Random Forest 
+# rf.train.1 <- subset(corr_data.1,select=FicoScore:Var_747)
+# rf.label <- corr_data.1$Income
+# 
+# set.seed(1234)
+# rf.1 <- randomForest(x = rf.train.1, y = rf.label, importance = TRUE, ntree = 1000)
+# 
+# varImpPlot(rf.1,type=2)
+
+# the randomforest does not work,requiring long computational time
+
+#==============================================================================
+
+#============================================================================== 
+# Using best subset for feature selection and prediction
+#==============================================================================
+# Train a linear regression
+dat <- subset(corr_data.1,Income < 80000 & Income > 100)
+fit<- lm(Income ~ ., data=dat)
+summary(fit)
+
+
+# Residual standard error: 14390 on 193422 degrees of freedom
+# Multiple R-squared:  0.2108,	Adjusted R-squared:  0.2099 
+# F-statistic: 225.6 on 229 and 193422 DF,  p-value: < 2.2e-16
+
+## Variable Selection
+
+# # All Subsets Regression: not working
+library(leaps)
+# regfit.full<-regsubsets(Income ~ .,data=dat,nvmax = 20, really.big=TRUE)
+# # view results 
+# summary(regfit.full)
+
+#perform forward stepwise selection
+regfit.fwd<-regsubsets(Income ~ .,data=dat,nvmax = 20, method = 'forward')
+# view results 
+summary(regfit.fwd)
+# plot a table of models showing variables in each model.
+# models are ordered by the selection statistic.
+plot(regfit.fwd,scale="r2")
+
+#perform backward stepwise selection
+regfit.bwd<-regsubsets(Income ~ .,data=dat,nvmax = 20, method = 'backward')
+# view results 
+summary(regfit.bwd)
+str(regfit.bwd)
+# plot a table of models showing variables in each model.
+# models are ordered by the selection statistic.
+plot(regfit.bwd,scale="r2")
+coef(regfit.bwd)
+
+# Choosing Among Models, Using Validation method(choose forward stepwise method, since it is faster)
+
+set.seed(1234)
+train.fwd=sample(c(TRUE,FALSE), nrow(dat),rep=TRUE)
+test.fwd=(!train.fwd)
+regfit.best=regsubsets(Income ~ .,data=dat[train.fwd,],nvmax = 230, method = 'forward')
+
+
+val.errors=rep(NA,229)
+test.mat=model.matrix(Income~.,data=dat[test.fwd,])
+ 
+for(i in 1:229){
+  coefi=coef(regfit.best,id=i)
+  pred=test.mat[,names(coefi)]%*%coefi
+  val.errors[i]=mean((dat$Income[test.fwd]-pred)^2)
+}
+
+which.min(val.errors)
+##plot the result
+plot(sqrt(val.errors),ylab = "Root MSE",pch=1,type = "b")
+points(sqrt(regfit.best$rss[-1]/nrow(dat[test.fwd,])),col="blue",pch=1,type = "b")
+legend("topleft",legend = c("Validation", "Training"),col=c("blue","black"),pch=1)
+
+coef(regfit.best,91)
+dat.mat <- model.matrix(Income~.,data=dat)
+pre_fwd <- dat.mat[,names(coef(regfit.best,91))]%*%coef(regfit.best,91)
+
+testing_rse <- sqrt(mean((dat$Income-pre_fwd)^2))
+
+#Using the result from forward stepwise selection to make predict
+col_names <- names(coef(regfit.best,91))
+comdat <- cbind.data.frame(Income =dat$Income,dat[,col_names[-1]])
+compfit <- lm(Income ~ ., data=comdat)
+summary(compfit)
+# Residual standard error: 14470 on 193560 degrees of freedom
+# Multiple R-squared:  0.2014,	Adjusted R-squared:  0.201 
+# F-statistic: 536.4 on 91 and 193560 DF,  p-value: < 2.2e-16
+
+
+# #  Model selection by cross-validation, 10 folds cross validation: 
+#requiring very long computational time, then don't work
+
+# k=10
+# set.seed(1234)
+# folds=sample(1:k,nrow(dat),replace=TRUE)
+# cv.errors=matrix(NA,k,229, dimnames=list(NULL, paste(1:229)))
+# 
+# for(j in 1:k){
+#   best.fit= regsubsets(Income ~ .,data=dat[folds!=j,],nvmax = 230, method = 'forward')
+#   test.mat=model.matrix(Income~.,data=dat[folds==j,])
+#   for(i in 1:229){
+#     coefi=coef(best.fit,id=i)
+#     pred=test.mat[,names(coefi)]%*%coefi
+#     cv.errors[j,i]=mean((dat$Income[folds==j]-pred)^2)
+#   }
+# }
+# mean.cv.errors=apply(cv.errors,2,mean)
+# mean.cv.errors
+# par(mfrow=c(1,1))
+# plot(mean.cv.errors,type='b')
+# reg.best=regsubsets(Income~.,data=dat, nvmax=230)
+ 
+
+#============================================================================== 
+#Using Lasso for feature selection and prediction
+#============================================================================== 
+
+train.lasso <- dat 
+
+library(glmnet)
+x=model.matrix(Income~.,train.lasso)[,-1]
+y=train.lasso$Income
+
+
+#create the grid for the lambda 
+grid=10^seq(10,-2,length=100)
+
+
+trainL=sample(1:nrow(x), nrow(x)/2)
+testL=(-trainL)
+y.test=y[testL]
+
+# The Lasso
+
+lasso.sample=glmnet(x,y,alpha=1,lambda=grid)
+plot(lasso.sample, xvar = "lambda", label = TRUE)
+
+#Model selection by cross-validation, 10 folds cross validation: 
+cv.out.sample=cv.glmnet(x[trainL,],y[trainL],alpha=1,type.measure = "mse", nfolds = 10)
+plot(cv.out.sample)
+bestlam.sample=cv.out.sample$lambda.min
+
+lasso.pred=predict(lasso.sample,s=bestlam.sample,newx=x[testL,])
+lasso_rse <- sqrt(mean((y.test-lasso.pred)^2))
+
+#prediction using lasso
+
+out=glmnet(x,y,alpha=1,lambda=grid)
+plot(out)
+cv.out=cv.glmnet(x,y,alpha=1,type.measure = "mse", nfolds = 10)
+plot(cv.out)
+bestlam=cv.out$lambda.min
+
+lasso.prediction=predict(lasso.sample,s=bestlam,newx=x)
+lasso_rse.1 <- sqrt(mean((y.test-lasso.prediction)^2))
+
+lasso.coef=predict(out,type="coefficients",s=bestlam) 
+lasso.coef
+lasso.coef[lasso.coef!=0]
+
+temp <- which(lasso.coef!=0,arr.ind=T)
+rownames(lasso.coef)[temp[,1]]
+
+#Using the result from Lasso varible selection to make predict
+col_names.lasso <- rownames(lasso.coef)[temp[,1]]
+comdat.lasso <- cbind.data.frame(Income =dat$Income,dat[,col_names.lasso[-1]])
+compfit.1 <- lm(Income ~ ., data=comdat.lasso)
+summary(compfit.1)
+
+# Residual standard error: 14510 on 193607 degrees of freedom
+# Multiple R-squared:  0.1978,	Adjusted R-squared:  0.1976 
+# F-statistic:  1085 on 44 and 193607 DF,  p-value: < 2.2e-16
+
+#==============================================================================
+
+# xgboost for the data removing the outliers
+#==============================================================================
+library(xgboost)
+
+xg.train <- subset(corr_data.1,Income < 930093000 & Income > 100,select=FicoScore:Var_747)
+xg.label <- subset(corr_data.1,Income < 930093000 & Income > 100)$Income
+
+param <- list("objective" = "reg:linear",booster = "gbtree",
+              "eval_metric" = "rmse",colsample_bytree = 0.7, subsample = 0.7)
+
+
+xgbmodel.1 <- xgboost(data = as.matrix(xg.train), params = param,
+                      nrounds = 45, max.depth = 10, eta = 0.01,
+                      label = xg.label, maximize = T)
+#[299]	train-rmse:464170.843750 
+#[300]	train-rmse:463786.437500 
+
+
+importance_matrix.1 <- xgb.importance(colnames(as.matrix(xg.train)),model = xgbmodel.1)
+print(importance_matrix.1)
+xgb.plot.importance(importance_matrix = importance_matrix.1,top_n=20,xlab = "Relative importance")
+
+#==============================================================================
+# xgboost for the data removing the extreme Income value
+#In this section we also do validation to find the optimal nrounds
+#the importance of the data
+#==============================================================================
+
+library(xgboost)
+
+dat <- subset(corr_data.1,Income < 80000 & Income > 100)
+
+xg.train.1 <- subset(dat,select=FicoScore:Var_747)
+xg.label.1 <- dat$Income
+
+param <- list("objective" = "reg:linear",booster = "gbtree",
+              "eval_metric" = "rmse",colsample_bytree = 0.8, subsample = 0.95)
+
+dtrain <- xgb.DMatrix(as.matrix(xg.train.1), label = xg.label.1)
+nround <- 100
+tuningpa<- xgb.cv(param, dtrain, nround, nfold=8, metrics={'rmse'})
+plot(tuningpa[[4]]$test_rmse_mean, xlab = "The number of iterations", ylab = "The test root mean square error")
+abline(v =which.min(tuningpa[[4]]$test_rmse_mean), col = "blue")
+#the optimal nrounds is 45 with the minimum test-rmse 
+#[45]	train-rmse:13482.679565+13.416235	test-rmse:14145.569458+40.757548
+xgbmodel <- xgboost(data = as.matrix(xg.train.1), params = param,
+                    nrounds = 45, max.depth = 10, eta = 0.01,
+                    label = xg.label.1, maximize = T)
+
+
+importance_matrix <- xgb.importance(colnames(as.matrix(xg.train.1)),model = xgbmodel)
+print(importance_matrix)
+xgb.plot.importance(importance_matrix = importance_matrix,top_n=20,xlab = "Relative importance")
+
+
+xg.predict<-predict(xgbmodel, as.matrix(xg.train.1))
+sse <- sum((xg.predict-xg.label.1)^2)
+
+# using the important features to do linear regression
+
+fit1 <- lm(Income ~ FicoScore + Var_001 + Var_007 + Var_233 + Var_030 + Var_074 + Var_225
+           + Var_060, data=dat)
+summary(fit1)
+# Residual standard error: 15150 on 193643 degrees of freedom
+# Multiple R-squared:  0.1245,	Adjusted R-squared:  0.1244 
+# F-statistic:  3441 on 8 and 193643 DF,  p-value: < 2.2e-16
+plot(fit1)
+
+
+fit2<- lm(Income ~ FicoScore + Var_001 + Var_007 + Var_233 + Var_030 + Var_074 + Var_225
+          + Var_060 + Var_231 + Var_375 +Var_011 +  Var_679  + Var_234 + Var_062 + Var_600
+          + Var_027, data=dat)
+summary(fit2)
+# Residual standard error: 14810 on 193635 degrees of freedom
+# Multiple R-squared:  0.1634,	Adjusted R-squared:  0.1633 
+# F-statistic:  2364 on 16 and 193635 DF,  p-value: < 2.2e-16
+plot(fit2)
+
+fit3<- lm(Income ~ FicoScore + Var_001 + Var_007  + Var_030 + Var_074 + Var_225
+          + Var_060 + Var_231 + Var_375 +Var_011 +  Var_679  + Var_234 + Var_062 + Var_600
+          + Var_027, data=dat)
+summary(fit3)
+# Residual standard error: 14810 on 193636 degrees of freedom
+# Multiple R-squared:  0.1634,	Adjusted R-squared:  0.1633 
+# F-statistic:  2521 on 15 and 193636 DF,  p-value: < 2.2e-16
+# 15 features
+#removing the outlier
+
+dat.leverage <- dat[-161356,]
+
+dat.leverage <- dat.leverage[-42649,]
+dat.leverage <- dat.leverage[-6959,]
+fit4<- lm(Income ~ FicoScore + Var_001 + Var_007 + Var_233 + Var_030 + Var_074 + Var_225
+          + Var_060 + Var_231 + Var_375 +Var_011 +  Var_679  + Var_234 + Var_062 + Var_600
+          + Var_027, data=dat.leverage)
+summary(fit4)
+# Residual standard error: 14810 on 193632 degrees of freedom
+# Multiple R-squared:  0.1634,	Adjusted R-squared:  0.1633 
+# F-statistic:  2364 on 16 and 193632 DF,  p-value: < 2.2e-16
+
+
+# the results shows that removing the outlier, we didnot get any gain
+
+################################################################
+# Regression with ExtraTrees:
+##require long computation time
+
+gc()
+library(rJava)
+options( java.parameters = "-Xmx7g" )
+library(extraTrees)
+setJavaMemory(8000)
+model.extree = extraTrees(as.matrix(xg.train.1),xg.label.1,ntree=1100)
+extree.pred=predict(model.extree,newdata=as.matrix(xg.train.1))
+
+#==============================================================================
+#
+#  Model Validation
+#
+#============================================================================== 
+
+#split the data set into two parts: train and test
+
+train.1 <- sample(1:nrow(dat), nrow(dat)/2)
+
+test.1=(-train.1)
+
+test.dat <- subset(dat[test.1,],select=FicoScore:Var_747)
+test.dat <- subset(dat[test.1,],select=FicoScore:na_count)
+#====================
+#linear regression
+#====================
+fit_lm<- lm(Income ~ FicoScore + Var_001 + Var_007 + Var_233 + Var_030 + Var_074 + Var_225
+            + Var_060 + Var_231 + Var_375 +Var_011 +  Var_679  + Var_234 + Var_062 + Var_600
+            + Var_027, data=dat[train.1,])
+# Residual standard error: 14750 on 96809 degrees of freedom
+# Multiple R-squared:  0.1673,	Adjusted R-squared:  0.1672 
+# F-statistic:  1216 on 16 and 96809 DF,  p-value: < 2.2e-16
+pre_lm <- predict(fit_lm, test.dat, se.fit = TRUE)
+rse.lm1 <- sqrt(mean((pre_lm$fit-dat[test.1,]$Income)^2))
+
+#14884.64
+ 
+a<- lm(Income ~ ., data=dat[train.1,])
+p<-predict(a, test.dat, se.fit = TRUE)
+sqrt(mean((p$fit-dat[test.1,]$Income)^2))
+#====================
+#xgboost regression
+#====================
+xxx <- subset(dat[train.1,],select=FicoScore:Var_747)
+xg.label.2 <-dat[train.1,]$Income
+xxx.test <-subset(dat[test.1,],select=FicoScore:Var_747)
+fit_xgbmodel <- xgboost(data = as.matrix(xxx), params = param,
+                        nrounds = 45, max.depth = 10, eta = 0.01,
+                        label = xg.label.2, maximize = T)
+#[45]	train-rmse:32419.804688 
+
+xg.predict<-predict(fit_xgbmodel, as.matrix(xxx.test))
+rse.xg1 <- sqrt(mean((xg.predict-dat[test.1,]$Income)^2))
+#32483.55
+#====================
+#Lasso regression
+#====================
+x=model.matrix(Income~.,dat)[,-1]
+y=dat$Income
+
+
+#create the grid for the lambda 
+grid=10^seq(10,-2,length=100)
+
+#Model selection by cross-validation, 10 folds cross validation: 
+cv.out.sample.1=cv.glmnet(x[train.1,],y[train.1],alpha=1, type.measure = "mse", nfolds = 10)
+plot(cv.out.sample.1)
+bestlam.sample.1=cv.out.sample.1$lambda.min
+rse.min <- sqrt(cv.out.sample.1$cvm[cv.out.sample.1$lambda == cv.out.sample.1$lambda.min])
+#16173.48
+lasso.pred.1=predict(lasso.sample,s=bestlam.sample.1,newx=x[test.1,])
+lasso_rse.1 <- sqrt(mean((y[test.1]-lasso.pred.1)^2))
+# 16014.74
+#====================
+#Best subset regression
+#==================== 
+regfit.best.1=regsubsets(Income ~ .,data=dat[train.1,],nvmax = 230, method = 'forward')
+# training 14322.71
+val.errors.1=rep(NA,229)
+test.mat.1=model.matrix(Income~.,data=dat[test.1,])
+
+for(i in 1:229){
+  coefi=coef(regfit.best,id=i)
+  pred=test.mat.1[,names(coefi)]%*%coefi
+  val.errors.1[i]=mean((dat$Income[test.1]-pred)^2)
+}
+
+which.min(val.errors.1)
+testing_rse.1 <- sqrt(val.errors.1[which.min(val.errors.1)])
+#14514.35
+
+#==============================================================================
+#
+#  Revising Model with the factor get involved 
+#
+#============================================================================== 
+factor.feature <- train[,c("Var_688","Var_689","Var_690","Var_691","Var_692","Var_693","Var_694","Var_695","Var_696","Var_697","Var_698","Var_699","Var_700","Var_701","Var_702")]
+
+
+#write the factors into file
+write.csv(factor.feature,"E:/payoff/factordataNum.csv" )
+factor.feature <- read.csv(choose.files(),header = T,sep = ",") 
+FI <- c()
+for(i in 1:(ncol(factor.feature))){
+  FI <- c(FI, cor(train$Income,as.numeric(factor.feature[,i]),use="complete.obs"))
+}
+
+# [1] "(Intercept)" "FicoScore"   "Var_007"     "Var_008"     "Var_027"     "Var_028"     "Var_031"    
+# [8] "Var_038"     "Var_051"     "Var_052"     "Var_055"     "Var_059"     "Var_060"     "Var_062"    
+# [15] "Var_066"     "Var_074"     "Var_153"     "Var_195"     "Var_200"     "Var_216"     "Var_234"    
+# [22] "Var_280"     "Var_354"     "Var_360"     "Var_371"     "Var_375"     "Var_418"     "Var_540"    
+# [29] "Var_543"     "Var_549"     "Var_594"     "Var_599"     "Var_600"     "Var_641"     "Var_644"    
+# [36] "Var_647"     "Var_649"     "Var_653"     "Var_679"     "Var_717"     "Var_718"     "Var_719"    
+# [43] "Var_724"     "Var_725"     "na_count"
+selected.feature <-c(col_names.lasso[-1],names(factor.feature))
+dat.factor <- train[,selected.feature]
+#replace the space with NA and convert the factors into numeric values
+
+dat.factor[,45][dat.factor[,45]==''] = NA
+dat.factor[,46][dat.factor[,46]==''] = NA
+dat.factor[,47][dat.factor[,47]==''] = NA
+dat.factor[,48][dat.factor[,48]==''] = NA
+dat.factor[,49][dat.factor[,49]==''] = NA
+dat.factor[,50][dat.factor[,50]==''] = NA
+dat.factor[,51][dat.factor[,51]==''] = NA
+dat.factor[,52][dat.factor[,52]==''] = NA
+dat.factor[,53][dat.factor[,53]==''] = NA
+dat.factor[,54][dat.factor[,54]==''] = NA
+dat.factor[,55][dat.factor[,55]==''] = NA
+dat.factor[,56][dat.factor[,56]==''] = NA
+dat.factor[,57][dat.factor[,57]==''] = NA
+dat.factor[,58][dat.factor[,58]==''] = NA
+dat.factor[,59][dat.factor[,59]==''] = NA
+ 
+dat.factor[,45] <- as.numeric(dat.factor[,45])
+dat.factor[,46] <- as.numeric(dat.factor[,46])
+dat.factor[,47] <- as.numeric(dat.factor[,47])
+dat.factor[,48] <- as.numeric(dat.factor[,48])
+dat.factor[,49] <- as.numeric(dat.factor[,49])
+dat.factor[,50] <- as.numeric(dat.factor[,50])
+dat.factor[,51] <- as.numeric(dat.factor[,51])
+dat.factor[,52] <- as.numeric(dat.factor[,52])
+dat.factor[,53] <- as.numeric(dat.factor[,53])
+dat.factor[,54] <- as.numeric(dat.factor[,54])
+dat.factor[,55] <- as.numeric(dat.factor[,55])
+dat.factor[,56] <- as.numeric(dat.factor[,56])
+dat.factor[,57] <- as.numeric(dat.factor[,57])
+dat.factor[,58] <- as.numeric(dat.factor[,58])
+dat.factor[,59] <- as.numeric(dat.factor[,59])
+
+dat.factor$na_count <- NULL
+dat.factor$na_countN <-  rowSums(is.na(dat.factor))
+
+write.csv(dat.factor,"E:/payoff/factordataset.csv" )
+dat.factor$Income <- train$Income
+
+# train the data with linear regression
+fit_factor<- lm(Income ~ ., data=dat.factor,na.rm=T)
+summary(fit_factor)
+
+#removing the extreme values, with all the columns
+dat.factor.1 <- subset(dat.factor,Income < 80000 & Income > 100)
+fit_factor.1<- lm(Income ~ ., data=dat.factor.1,na.rm=T)
+summary(fit_factor.1)
+
+#removing the extreme values, with the selected columns
+dat.factor.2 <- subset(dat.factor,Income < 80000 & Income > 100,select =c(1:43,59,60) )
+dat.factor.2 <- subset(dat.factor,Income < 80000 & Income > 100,select =c(1:43,59,60) )
+fit_factor.2<- lm(Income ~ ., data=dat.factor.2,na.rm=T)
+summary(fit_factor.2)
